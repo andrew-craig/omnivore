@@ -1,5 +1,6 @@
 import { RedisDataSource } from '@omnivore/utils'
 import { BulkJobOptions, Queue } from 'bullmq'
+import { MemoryQueue, memoryQueueRegistry } from './memory-queue'
 
 const QUEUE_NAME = 'omnivore-backend-queue'
 const JOB_NAME = 'save-page'
@@ -69,7 +70,7 @@ const getOpts = (job: SavePageJob): BulkJobOptions => {
   }
 }
 
-export const queueSavePageJob = async (
+export const queueSavePageJobRedis = async (
   redisDataSource: RedisDataSource,
   savePageJobs: SavePageJob[]
 ) => {
@@ -87,5 +88,22 @@ export const queueSavePageJob = async (
     connection: redisDataSource.queueRedisClient,
   })
 
+  return queue.addBulk(jobs)
+}
+
+export const queueSavePageJobMem = async (
+  savePageJobs: SavePageJob[]
+) => {
+  const jobs = savePageJobs.map((job) => ({
+    name: JOB_NAME,
+    data: job.data,
+    opts: getOpts(job),
+  }))
+  console.log(
+    'queue save page jobs:',
+    jobs.map((job) => job.data.finalUrl)
+  )
+
+  const queue = memoryQueueRegistry.getQueue(QUEUE_NAME)
   return queue.addBulk(jobs)
 }

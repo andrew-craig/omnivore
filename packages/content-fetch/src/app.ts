@@ -4,6 +4,7 @@ import express, { Express } from 'express'
 import asyncHandler from 'express-async-handler'
 import { JobData, processFetchContentJob } from './request_handler'
 import { createWorker, getQueue, QUEUE } from './worker'
+import { memoryQueueRegistry } from './memory-queue'
 
 const main = () => {
   console.log('Starting worker...')
@@ -18,7 +19,10 @@ const main = () => {
   app.use(express.json())
   app.use(express.urlencoded({ extended: true }))
 
-  // create redis source
+  const useRedis = process.env.USE_REDIS !== 'false'
+
+  // create redis source - always create it but only use Redis features when enabled
+  // todo: confirm if this is needed
   const redisDataSource = new RedisDataSource({
     cache: {
       url: process.env.REDIS_URL,
@@ -52,31 +56,33 @@ const main = () => {
     asyncHandler(async (_, res) => {
       let output = ''
 
-      const queue = await getQueue(redisDataSource.queueRedisClient)
+      if (useRedis) {
+        const queue = await getQueue(redisDataSource.queueRedisClient)
 
-      const jobsTypes: Array<JobType> = [
-        'active',
-        'failed',
-        'completed',
-        'prioritized',
-      ]
-      const counts = await queue.getJobCounts(...jobsTypes)
+        const jobsTypes: Array<JobType> = [
+          'active',
+          'failed',
+          'completed',
+          'prioritized',
+        ]
+        const counts = await queue.getJobCounts(...jobsTypes)
 
-      jobsTypes.forEach((metric) => {
-        output += `# TYPE omnivore_queue_messages_${metric} gauge\n`
-        output += `omnivore_queue_messages_${metric}{queue="${QUEUE}"} ${counts[metric]}\n`
-      })
+        jobsTypes.forEach((metric) => {
+          output += `# TYPE omnivore_queue_messages_${metric} gauge\n`
+          output += `omnivore_queue_messages_${metric}{queue="${QUEUE}"} ${counts[metric]}\n`
+        })
 
-      // Export the age of the oldest prioritized job in the queue
-      const oldestJobs = await queue.getJobs(['prioritized'], 0, 1, true)
-      if (oldestJobs.length > 0) {
-        const currentTime = Date.now()
-        const ageInSeconds = (currentTime - oldestJobs[0].timestamp) / 1000
-        output += `# TYPE omnivore_queue_messages_oldest_job_age_seconds gauge\n`
-        output += `omnivore_queue_messages_oldest_job_age_seconds{queue="${QUEUE}"} ${ageInSeconds}\n`
-      } else {
-        output += `# TYPE omnivore_queue_messages_oldest_job_age_seconds gauge\n`
-        output += `omnivore_queue_messages_oldest_job_age_seconds{queue="${QUEUE}"} ${0}\n`
+        // Export the age of the oldest prioritized job in the queue
+        const oldestJobs = await queue.getJobs(['prioritized'], 0, 1, true)
+        if (oldestJobs.length > 0) {
+          const currentTime = Date.now()
+          const ageInSeconds = (currentTime - oldestJobs[0].timestamp) / 1000
+          output += `# TYPE omnivore_queue_messages_oldest_job_age_seconds gauge\n`
+          output += `omnivore_queue_messages_oldest_job_age_seconds{queue="${QUEUE}"} ${ageInSeconds}\n`
+        } else {
+          output += `# TYPE omnivore_queue_messages_oldest_job_age_seconds gauge\n`
+          output += `omnivore_queue_messages_oldest_job_age_seconds{queue="${QUEUE}"} ${0}\n`
+        }
       }
 
       res.status(200).setHeader('Content-Type', 'text/plain').send(output)
@@ -135,8 +141,13 @@ const main = () => {
     await worker.close()
     console.log('Worker closed')
 
-    await redisDataSource.shutdown()
-    console.log('Redis connection closed')
+    if (useRedis) {
+      await redisDataSource.shutdown()
+      console.log('Redis connection closed')
+    } else {
+      await memoryQueueRegistry.shutdown()
+      console.log('Memory queue registry shutdown')
+    }
 
     process.exit(0)
   }

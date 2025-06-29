@@ -6,7 +6,7 @@ import 'dotenv/config'
 import jwt from 'jsonwebtoken'
 import { promisify } from 'util'
 import { analytics } from './analytics'
-import { queueSavePageJob } from './job'
+import { queueSavePageJobRedis, queueSavePageJobMem } from './job'
 
 interface UserConfig {
   id: string
@@ -67,7 +67,6 @@ const bucketName = process.env.GCS_UPLOAD_BUCKET || 'omnivore-files'
 const NO_CACHE_URLS = [
   'https://deviceandbrowserinfo.com/are_you_a_bot',
   'https://deviceandbrowserinfo.com/info_device',
-  'https://jacksonh.org',
 ]
 
 const signToken = promisify(jwt.sign)
@@ -142,14 +141,21 @@ const getCachedFetchResult = async (
 
 const failureRedisKey = (domain: string) => `fetch-failure:${domain}`
 
-const isDomainBlocked = async (
-  redisDataSource: RedisDataSource,
+const isPermanentDomainBlocked = async (
   domain: string
 ) => {
   const blockedDomains = ['localhost', 'weibo.com']
   if (blockedDomains.includes(domain)) {
     return true
   }
+
+  return false
+}
+
+const isTempDomainBlocked = async (
+  redisDataSource: RedisDataSource,
+  domain: string
+) => {
 
   const key = failureRedisKey(domain)
   const redisClient = redisDataSource.cacheClient
@@ -273,7 +279,13 @@ export const processFetchContentJob = async (
 
   try {
     const domain = new URL(url).hostname
-    const isBlocked = await isDomainBlocked(redisDataSource, domain)
+    let isBlocked = await isPermanentDomainBlocked(domain)
+    const useRedis = process.env.USE_REDIS !== 'false'
+    if (useRedis) {
+      const isTempBlocked = await isTempDomainBlocked(redisDataSource, domain)
+      isBlocked = isBlocked || isTempBlocked
+    }
+
     if (isBlocked) {
       console.log('domain is blocked', domain)
       logRecord.error = 'domain is blocked'
@@ -282,24 +294,35 @@ export const processFetchContentJob = async (
     }
 
     const key = cacheKey(url, locale, timezone)
-    let fetchResult = await getCachedFetchResult(redisDataSource, key)
-    if (!fetchResult) {
-      console.log(
-        'fetch result not found in cache, fetching content now...',
-        url
-      )
+    let fetchResult = undefined
 
+    if (useRedis) {
+      fetchResult = await getCachedFetchResult(redisDataSource, key)
+      if (!fetchResult) {
+        console.log(
+          'fetch result not found in cache, fetching content now...',
+          url
+        )
+
+        try {
+          fetchResult = await fetchContent(url, locale, timezone)
+          console.log('content has been fetched')
+        } catch (error) {
+          await incrementContentFetchFailure(redisDataSource, domain)
+          throw error
+        }
+
+        if (fetchResult.content && !NO_CACHE_URLS.includes(url)) {
+          await cacheFetchResult(redisDataSource, key, fetchResult)
+        }
+      }
+    } else {
+      console.log('Redis disabled, fetching content directly...', url)
       try {
         fetchResult = await fetchContent(url, locale, timezone)
         console.log('content has been fetched')
       } catch (error) {
-        await incrementContentFetchFailure(redisDataSource, domain)
-
         throw error
-      }
-
-      if (fetchResult.content && !NO_CACHE_URLS.includes(url)) {
-        await cacheFetchResult(redisDataSource, key, fetchResult)
       }
     }
 
@@ -333,7 +356,7 @@ export const processFetchContentJob = async (
       priority,
     }))
 
-    const jobs = await queueSavePageJob(redisDataSource, savePageJobs)
+    const jobs = useRedis ? await queueSavePageJobRedis(redisDataSource, savePageJobs) : await queueSavePageJobMem(savePageJobs)
     console.log('save-page jobs queued', jobs.length)
   } catch (error) {
     if (error instanceof Error) {
